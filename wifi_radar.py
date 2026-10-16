@@ -355,6 +355,11 @@ class App:
         self._record_flag = False
         self._lock = threading.Lock()
 
+        # сглаживание/анимация
+        self.target_q = 0.0     # куда стремимся (реальное чтение)
+        self.display_q = 0.0    # что показываем сейчас (плавно догоняет target)
+        self.frame = 0
+
         root.title(APP_NAME)
         root.configure(bg=BG)
         root.resizable(False, False)
@@ -400,10 +405,10 @@ class App:
                                                outline="#30a46c", width=24)
         # маркер рекорда
         self.best_dot = self.canvas.create_oval(0, 0, 0, 0, outline="", fill="")
-        # крупное число
-        self.num_item = self.canvas.create_text(self.cx - 6, self.cy - 6, text="0",
-                                                 font=self.f_big, fill=FG, anchor="e")
-        self.unit_item = self.canvas.create_text(self.cx + 2, self.cy + 2, text="%",
+        # крупное число (позиция пересчитывается, чтобы «41 %» было по центру)
+        self.num_item = self.canvas.create_text(self.cx, self.cy - 4, text="0",
+                                                 font=self.f_big, fill=FG, anchor="w")
+        self.unit_item = self.canvas.create_text(self.cx, self.cy + 6, text="%",
                                                   font=self.f_unit, fill=MUTED, anchor="w")
         self.dbm_item = self.canvas.create_text(self.cx, self.cy + 48, text="",
                                                  font=self.f_sub, fill=MUTED)
@@ -451,7 +456,7 @@ class App:
         self.beeper = Beeper(self)
         self.beeper.start()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.tick()
+        self.loop()
 
     # --- действия ---
     def _toggle_sound(self):
@@ -510,45 +515,50 @@ class App:
             pts.extend((x0 + i * step, yv(v)))
         col = color_for(vals[-1])
         g.create_line(*pts, fill=col, width=2, smooth=True)
-        g.create_oval(pts[-2] - 3, pts[-1] - 3, pts[-2] + 3, pts[-1] + 3,
-                      fill=col, outline="")
 
-    # --- основной цикл обновления ---
-    def tick(self):
+    # --- отрисовка шкалы по дробному значению (для плавной анимации) ---
+    def _render_gauge(self, q, muted=False):
+        col = MUTED if muted else color_for(q)
+        self.canvas.itemconfig(self.arc_val, extent=-240 * q / 100.0, outline=col)
+        num = "—" if muted else str(int(round(q)))
+        nw = self.f_big.measure(num)
+        uw = 0 if muted else self.f_unit.measure("%")
+        gap = 0 if muted else 5
+        left = self.cx - (nw + gap + uw) / 2.0
+        self.canvas.coords(self.num_item, left, self.cy - 4)
+        self.canvas.itemconfig(self.num_item, text=num, fill=(MUTED if muted else FG))
+        self.canvas.coords(self.unit_item, left + nw + gap, self.cy + 6)
+        self.canvas.itemconfig(self.unit_item, text=("" if muted else "%"))
+
+    # --- чтение сигнала + обновление подписей (раз в несколько кадров) ---
+    def _read_and_update(self):
         try:
             data = read_signal()
         except Exception:
             data = {"connected": False, "q": None, "dbm": None, "ssid": None}
 
         self.connected = bool(data.get("connected"))
-        c = self.tk
 
         if not self.connected:
             self.current_q = 0
-            self.canvas.itemconfig(self.arc_val, extent=0)
-            self.canvas.itemconfig(self.num_item, text="—")
+            self.target_q = 0.0
             self.canvas.itemconfig(self.dbm_item, text="нет связи с точкой")
             self.status_lbl.config(text="не подключено", fg=MUTED)
             self.ssid_lbl.config(text="сеть: —")
             self.trend_lbl.config(text="")
             self.canvas.itemconfig(self.best_dot, outline="", fill="")
-            self.history.append(0)
+            self.history.append(self.display_q)
             self.draw_graph()
-            self.root.after(500, self.tick)
             return
 
-        q = int(data.get("q") or 0)
-        q = max(0, min(100, q))
+        q = max(0, min(100, int(data.get("q") or 0)))
         self.current_q = q
-        col = color_for(q)
+        self.target_q = float(q)
 
-        # дуга + число
-        self.canvas.itemconfig(self.arc_val, extent=-240 * q / 100.0, outline=col)
-        self.canvas.itemconfig(self.num_item, text=str(q), fill=FG)
         dbm = data.get("dbm")
         self.canvas.itemconfig(self.dbm_item,
                                text=("%d dBm" % dbm) if dbm is not None else "")
-        self.status_lbl.config(text=label_for(q), fg=col)
+        self.status_lbl.config(text=label_for(q), fg=color_for(q))
 
         ssid = data.get("ssid")
         self.ssid_lbl.config(text="сеть: %s" % (ssid if ssid else "—"))
@@ -571,11 +581,25 @@ class App:
             self.canvas.itemconfig(self.best_dot, outline="#ffffff", fill="")
         self.best_lbl.config(text="рекорд: %d%%" % self.best if self.best >= 0 else "рекорд: —")
 
-        self.history.append(q)
+        self.history.append(self.display_q)  # пишем сглаженное — линия ровнее
         self.draw_graph()
-
         self.prev = q
-        self.root.after(350, self.tick)
+
+    # --- главный цикл: чтение по таймеру + плавная анимация каждый кадр ---
+    def loop(self):
+        # читаем сигнал не каждый кадр, а раз в ~320 мс
+        if self.frame % 8 == 0:
+            self._read_and_update()
+
+        # плавно подтягиваем показываемое значение к целевому
+        self.display_q += (self.target_q - self.display_q) * 0.18
+        if abs(self.target_q - self.display_q) < 0.05:
+            self.display_q = self.target_q
+
+        self._render_gauge(self.display_q, muted=not self.connected)
+
+        self.frame += 1
+        self.root.after(40, self.loop)  # ~25 кадров/с
 
 
 def main():
