@@ -75,6 +75,32 @@ def label_for(q):
     return "очень слабо"
 
 
+# Грубая оценка расстояния до точки по уровню сигнала (модель затухания).
+# Это именно ПРИКИДКА: реальное расстояние зависит от стен, мебели и мощности
+# роутера. Калибровка (замер в 1 м от роутера) заметно повышает точность.
+REF_DBM_1M = -40.0   # типичный уровень в 1 м от бытового роутера
+PATH_LOSS_N = 3.0    # показатель затухания в квартире (2 — открыто, 3–4 — стены)
+
+
+def estimate_distance_m(dbm, ref_dbm=REF_DBM_1M, n=PATH_LOSS_N):
+    try:
+        return 10.0 ** ((ref_dbm - dbm) / (10.0 * n))
+    except Exception:
+        return None
+
+
+def format_distance(d):
+    if d is None:
+        return ""
+    if d < 1:
+        return "≈ меньше 1 м до точки"
+    if d > 50:
+        return "≈ больше 50 м до точки"
+    if d < 10:
+        return "≈ %.1f м до точки" % d
+    return "≈ %d м до точки" % round(d)
+
+
 def _run(cmd, timeout=4):
     """Запустить команду, вернуть stdout (пустую строку при любой ошибке)."""
     try:
@@ -457,6 +483,10 @@ class App:
         self.log_path = None
         self._log_last = 0.0
 
+        # оценка расстояния до точки
+        self.ref_dbm = REF_DBM_1M   # опорный уровень в 1 м (можно калибровать)
+        self._last_dbm = None       # последний dBm (реальный или из %)
+
         root.title(APP_NAME)
         root.configure(bg=BG)
         root.resizable(False, False)
@@ -470,7 +500,7 @@ class App:
         except Exception:
             pass
         try:
-            root.geometry("440x748")
+            root.geometry("440x784")
         except Exception:
             pass
 
@@ -527,6 +557,18 @@ class App:
         # Статус
         self.status_lbl = tk.Label(root, text="—", font=self.f_status, bg=BG, fg=MUTED)
         self.status_lbl.pack(pady=(4, 0))
+
+        # Оценка расстояния до точки + калибровка
+        distrow = tk.Frame(root, bg=BG)
+        distrow.pack(pady=(2, 0))
+        self.dist_lbl = tk.Label(distrow, text="", font=self.f_small, bg=BG, fg=MUTED)
+        self.dist_lbl.grid(row=0, column=0, padx=8)
+        self.calib_btn = tk.Button(distrow, text="я в 1 м — откалибровать",
+                                   command=self._calibrate, font=self.f_small,
+                                   bg=CARD, fg=FG, activebackground=TRACK,
+                                   activeforeground=FG, bd=0, padx=10, pady=3,
+                                   highlightthickness=0)
+        self.calib_btn.grid(row=0, column=1, padx=8)
 
         # Живой график силы сигнала (последние ~30 с)
         self.GW, self.GH = 400, 78
@@ -616,6 +658,12 @@ class App:
         self.best = -1
         self.best_lbl.config(text="рекорд: —")
 
+    def _calibrate(self):
+        # нажимать стоя примерно в 1 метре от роутера
+        if self._last_dbm is not None:
+            self.ref_dbm = float(self._last_dbm)
+            self.dist_lbl.config(text="откалибровано ✓")
+
     # --- запись замеров в CSV ---
     def _toggle_log(self):
         if self.log_var.get():
@@ -630,7 +678,7 @@ class App:
             self.log_fh = open(self.log_path, "w", newline="", encoding="utf-8")
             self.log_writer = csv.writer(self.log_fh)
             self.log_writer.writerow(
-                ["time", "target", "ssid", "quality_percent", "dbm"])
+                ["time", "target", "ssid", "quality_percent", "dbm", "dist_m_approx"])
             self.log_fh.flush()
             self.logging = True
             self._log_last = 0.0
@@ -652,7 +700,7 @@ class App:
         if self.log_path:
             self.log_lbl.config(text="сохранено: %s" % self.log_path, fg=MUTED)
 
-    def _log_row(self, q, dbm, ssid):
+    def _log_row(self, q, dbm, ssid, dist):
         if not self.logging or not self.log_writer:
             return
         now = time.time()
@@ -663,10 +711,19 @@ class App:
         try:
             self.log_writer.writerow([
                 datetime.now().isoformat(timespec="seconds"),
-                target, ssid or "", q, "" if dbm is None else dbm])
+                target, ssid or "", q, "" if dbm is None else dbm,
+                "" if dist is None else round(dist, 1)])
             self.log_fh.flush()
         except Exception:
             pass
+
+    def _update_distance(self, q, dbm):
+        # реальный dBm, иначе псевдо-dBm из процентов (та же шкала, что у стрелки)
+        dbm_val = dbm if dbm is not None else (q * 0.6 - 90.0)
+        self._last_dbm = dbm_val
+        dist = estimate_distance_m(dbm_val, self.ref_dbm)
+        self.dist_lbl.config(text=format_distance(dist))
+        return dist
 
     def _on_close(self):
         for t in ("beeper", "scanner"):
@@ -747,6 +804,7 @@ class App:
             self.target_q = 0.0
             self.status_lbl.config(text="сеть не видна", fg=MUTED)
             self.trend_lbl.config(text="")
+            self.dist_lbl.config(text="")
             self.canvas.itemconfig(self.best_dot, outline="", fill="")
             self.history.append(self.display_q)
             self.draw_graph()
@@ -774,7 +832,8 @@ class App:
             self.canvas.itemconfig(self.best_dot, outline="#ffffff", fill="")
         self.best_lbl.config(text="рекорд: %d%%" % self.best if self.best >= 0 else "рекорд: —")
 
-        self._log_row(q, None, ssid)
+        dist = self._update_distance(q, None)
+        self._log_row(q, None, ssid, dist)
         self.history.append(self.display_q)
         self.draw_graph()
         self.prev = q
@@ -798,6 +857,7 @@ class App:
             self.status_lbl.config(text="не подключено", fg=MUTED)
             self.ssid_lbl.config(text="сеть: —")
             self.trend_lbl.config(text="")
+            self.dist_lbl.config(text="")
             self.canvas.itemconfig(self.best_dot, outline="", fill="")
             self.history.append(self.display_q)
             self.draw_graph()
@@ -833,7 +893,8 @@ class App:
             self.canvas.itemconfig(self.best_dot, outline="#ffffff", fill="")
         self.best_lbl.config(text="рекорд: %d%%" % self.best if self.best >= 0 else "рекорд: —")
 
-        self._log_row(q, dbm, ssid)
+        dist = self._update_distance(q, dbm)
+        self._log_row(q, dbm, ssid, dist)
         self.history.append(self.display_q)  # пишем сглаженное — линия ровнее
         self.draw_graph()
         self.prev = q
