@@ -18,6 +18,7 @@ import re
 import subprocess
 import threading
 import time
+from collections import deque
 
 APP_NAME = "Wi-Fi Radar"
 
@@ -358,7 +359,16 @@ class App:
         root.configure(bg=BG)
         root.resizable(False, False)
         try:
-            root.geometry("440x600")
+            import os
+            _icon = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "assets", "icon.png")
+            if os.path.isfile(_icon):
+                self._iconimg = tk.PhotoImage(file=_icon)
+                root.iconphoto(True, self._iconimg)
+        except Exception:
+            pass
+        try:
+            root.geometry("440x708")
         except Exception:
             pass
 
@@ -401,6 +411,15 @@ class App:
         # Статус
         self.status_lbl = tk.Label(root, text="—", font=self.f_status, bg=BG, fg=MUTED)
         self.status_lbl.pack(pady=(4, 0))
+
+        # Живой график силы сигнала (последние ~30 с)
+        self.GW, self.GH = 400, 78
+        self.history = deque(maxlen=90)
+        tk.Label(root, text="сигнал за последние ~30 с", font=self.f_small,
+                 bg=BG, fg=MUTED).pack(pady=(14, 3))
+        self.graph = tk.Canvas(root, width=self.GW, height=self.GH, bg=CARD,
+                               highlightthickness=0)
+        self.graph.pack()
 
         # Инфо-строки
         info = tk.Frame(root, bg=BG)
@@ -464,6 +483,36 @@ class App:
         y = self.cy - self.r * math.sin(rad)
         return x, y
 
+    # --- отрисовка живого графика ---
+    def draw_graph(self):
+        g = self.graph
+        g.delete("all")
+        w, h, pad = self.GW, self.GH, 8
+        inner = h - 2 * pad
+
+        def yv(v):
+            return pad + inner * (1 - max(0, min(100, v)) / 100.0)
+
+        # ориентиры 0 / 50 / 100 %
+        for lvl in (0, 50, 100):
+            y = yv(lvl)
+            g.create_line(pad, y, w - pad, y, fill=TRACK,
+                          dash=(2, 4) if lvl == 50 else (1, 6))
+
+        vals = list(self.history)
+        n = len(vals)
+        if n < 2:
+            return
+        step = (w - 2 * pad) / (self.history.maxlen - 1)
+        x0 = w - pad - (n - 1) * step  # прижать свежие данные к правому краю
+        pts = []
+        for i, v in enumerate(vals):
+            pts.extend((x0 + i * step, yv(v)))
+        col = color_for(vals[-1])
+        g.create_line(*pts, fill=col, width=2, smooth=True)
+        g.create_oval(pts[-2] - 3, pts[-1] - 3, pts[-2] + 3, pts[-1] + 3,
+                      fill=col, outline="")
+
     # --- основной цикл обновления ---
     def tick(self):
         try:
@@ -483,6 +532,8 @@ class App:
             self.ssid_lbl.config(text="сеть: —")
             self.trend_lbl.config(text="")
             self.canvas.itemconfig(self.best_dot, outline="", fill="")
+            self.history.append(0)
+            self.draw_graph()
             self.root.after(500, self.tick)
             return
 
@@ -519,6 +570,9 @@ class App:
             self.canvas.coords(self.best_dot, bx - 7, by - 7, bx + 7, by + 7)
             self.canvas.itemconfig(self.best_dot, outline="#ffffff", fill="")
         self.best_lbl.config(text="рекорд: %d%%" % self.best if self.best >= 0 else "рекорд: —")
+
+        self.history.append(q)
+        self.draw_graph()
 
         self.prev = q
         self.root.after(350, self.tick)
