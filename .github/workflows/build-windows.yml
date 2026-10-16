@@ -1,0 +1,41 @@
+name: Build Windows exe
+
+on:
+  push:
+    tags: ["v*"]          # на тег vX.Y.Z — собрать и приложить к релизу
+  workflow_dispatch: {}    # и вручную по кнопке в Actions
+
+permissions:
+  contents: write           # чтобы приложить exe к GitHub Release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pyinstaller
+
+      - name: Build exe
+        run: >
+          python -m PyInstaller --onefile --windowed --name wifi-radar
+          --icon assets/icon.ico
+          --add-data "assets/icon.png;assets"
+          wifi_radar.py
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wifi-radar-windows
+          path: dist/wifi-radar.exe
+
+      - name: Attach exe to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/wifi-radar.exe
