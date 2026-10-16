@@ -227,6 +227,58 @@ def read_signal():
     return {"q": None, "dbm": None, "ssid": None, "iface": None, "connected": False}
 
 
+# ── Сканирование всех соседних сетей (без пароля — из открытых маячков) ──
+
+def _scan_linux(rescan=True):
+    args = ["nmcli", "-t", "-f", "SIGNAL,SSID", "dev", "wifi", "list",
+            "--rescan", "yes" if rescan else "no"]
+    out = _run(args)
+    nets = {}
+    for ln in out.splitlines():
+        sig, sep, ssid = ln.partition(":")
+        if not sep or not sig.isdigit():
+            continue
+        ssid = ssid.replace("\\:", ":").strip()
+        if not ssid:
+            continue  # скрытая сеть — пропускаем
+        q = int(sig)
+        if ssid not in nets or q > nets[ssid]:
+            nets[ssid] = q
+    return nets
+
+
+def _scan_windows():
+    out = _run(["netsh", "wlan", "show", "networks", "mode=bssid"])
+    nets = {}
+    cur = None
+    for ln in out.splitlines():
+        s = ln.strip()
+        m = re.match(r"SSID\s+\d+\s*:\s*(.*)$", s)
+        if m:
+            cur = m.group(1).strip() or None
+            continue
+        if cur:
+            mp = re.search(r"(\d{1,3})\s*%", s)
+            if mp:
+                q = int(mp.group(1))
+                if cur not in nets or q > nets[cur]:
+                    nets[cur] = q
+    return nets
+
+
+def scan_networks():
+    """Вернуть {ssid: качество 0..100} по всем видимым сетям. Без пароля."""
+    system = platform.system()
+    try:
+        if system == "Linux":
+            return _scan_linux()
+        if system == "Windows":
+            return _scan_windows()
+    except Exception:
+        pass
+    return {}
+
+
 # ──────────────────────────────────────────────────────────────────────────
 #  Звук (писк, по платформам)
 # ──────────────────────────────────────────────────────────────────────────
@@ -325,6 +377,27 @@ class Beeper(threading.Thread):
         self._stop.set()
 
 
+class Scanner(threading.Thread):
+    """Периодически сканирует соседние сети: держит список для выпадающего
+    меню и уровень выбранной (не подключённой) сети."""
+    def __init__(self, app):
+        super().__init__(daemon=True)
+        self.app = app
+        self._stop = threading.Event()
+
+    def run(self):
+        while not self._stop.is_set():
+            nets = scan_networks()
+            if nets:
+                self.app.scan_targets = nets
+                self.app.networks = sorted(nets, key=lambda k: -nets[k])
+            # когда наведены на чужую сеть — сканируем чаще
+            self._stop.wait(2.5 if self.app.target_ssid else 8.0)
+
+    def stop(self):
+        self._stop.set()
+
+
 # ──────────────────────────────────────────────────────────────────────────
 #  Графический интерфейс
 # ──────────────────────────────────────────────────────────────────────────
@@ -360,6 +433,12 @@ class App:
         self.display_q = 0.0    # что показываем сейчас (плавно догоняет target)
         self.frame = 0
 
+        # выбор сети для наблюдения
+        self.target_ssid = None     # None = текущая подключённая сеть
+        self.scan_targets = {}      # {ssid: качество} из последнего скана
+        self.networks = []          # имена сетей для меню
+        self._menu_names = None     # что сейчас в меню (чтобы не перестраивать зря)
+
         root.title(APP_NAME)
         root.configure(bg=BG)
         root.resizable(False, False)
@@ -373,7 +452,7 @@ class App:
         except Exception:
             pass
         try:
-            root.geometry("440x708")
+            root.geometry("440x748")
         except Exception:
             pass
 
@@ -388,6 +467,20 @@ class App:
         tk.Label(root, text="Wi-Fi Radar", font=self.f_title, bg=BG, fg=FG).pack(pady=(18, 2))
         tk.Label(root, text="чем сильнее сигнал — тем чаще писк",
                  font=self.f_small, bg=BG, fg=MUTED).pack(pady=(0, 6))
+
+        # Выбор сети: можно навестись на ЛЮБУЮ видимую сеть (пароль не нужен)
+        selrow = tk.Frame(root, bg=BG)
+        selrow.pack(pady=(0, 2))
+        tk.Label(selrow, text="сеть:", font=self.f_small, bg=BG, fg=MUTED
+                 ).grid(row=0, column=0, padx=(0, 6))
+        self.net_var = tk.StringVar(value="Текущая сеть")
+        self.net_menu = tk.OptionMenu(selrow, self.net_var, "Текущая сеть")
+        self.net_menu.config(font=self.f_small, bg=CARD, fg=FG, bd=0, width=22,
+                             highlightthickness=0, activebackground=TRACK,
+                             activeforeground=FG)
+        self.net_menu["menu"].config(bg=CARD, fg=FG, bd=0,
+                                     activebackground=TRACK, activeforeground=FG)
+        self.net_menu.grid(row=0, column=1)
 
         # Шкала-дуга
         self.CW, self.CH = 400, 270
@@ -455,8 +548,35 @@ class App:
 
         self.beeper = Beeper(self)
         self.beeper.start()
+        self.scanner = Scanner(self)
+        self.scanner.start()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.loop()
+
+    # --- выбор сети ---
+    def _on_net_change(self, choice):
+        self.target_ssid = None if choice == "Текущая сеть" else choice
+        # сброс, чтобы график и рекорд относились к новой сети
+        self.best = -1
+        self.prev = -1
+        self.history.clear()
+        self.best_lbl.config(text="рекорд: —")
+
+    def _rebuild_net_menu(self, names):
+        if names == self._menu_names:
+            return
+        self._menu_names = list(names)
+        m = self.net_menu["menu"]
+        m.delete(0, "end")
+        m.add_command(label="Текущая сеть",
+                      command=lambda: (self.net_var.set("Текущая сеть"),
+                                       self._on_net_change("Текущая сеть")))
+        for nm in names:
+            q = self.scan_targets.get(nm)
+            label = "%s  (%d%%)" % (nm, q) if q is not None else nm
+            m.add_command(label=label,
+                          command=lambda v=nm: (self.net_var.set(v),
+                                                self._on_net_change(v)))
 
     # --- действия ---
     def _toggle_sound(self):
@@ -467,10 +587,11 @@ class App:
         self.best_lbl.config(text="рекорд: —")
 
     def _on_close(self):
-        try:
-            self.beeper.stop()
-        except Exception:
-            pass
+        for t in ("beeper", "scanner"):
+            try:
+                getattr(self, t).stop()
+            except Exception:
+                pass
         self.root.destroy()
 
     def consume_record_flag(self):
@@ -530,8 +651,55 @@ class App:
         self.canvas.coords(self.unit_item, left + nw + gap, self.cy + 6)
         self.canvas.itemconfig(self.unit_item, text=("" if muted else "%"))
 
+    # --- обновление по выбранной (не подключённой) сети: из сканов ---
+    def _update_targeted(self):
+        ssid = self.target_ssid
+        q = self.scan_targets.get(ssid)
+        self.ssid_lbl.config(text="сеть: %s" % ssid)
+        self.canvas.itemconfig(self.dbm_item, text="")
+
+        if q is None:
+            self.connected = False
+            self.current_q = 0
+            self.target_q = 0.0
+            self.status_lbl.config(text="сеть не видна", fg=MUTED)
+            self.trend_lbl.config(text="")
+            self.canvas.itemconfig(self.best_dot, outline="", fill="")
+            self.history.append(self.display_q)
+            self.draw_graph()
+            return
+
+        q = max(0, min(100, int(q)))
+        self.connected = True
+        self.current_q = q
+        self.target_q = float(q)
+        self.status_lbl.config(text=label_for(q), fg=color_for(q))
+
+        if q > self.prev:
+            self.trend_lbl.config(text="↑ теплее", fg="#30a46c")
+        elif q < self.prev:
+            self.trend_lbl.config(text="↓ холоднее", fg="#e5484d")
+        else:
+            self.trend_lbl.config(text="= ровно", fg=MUTED)
+
+        if q > self.best:
+            self.best = q
+            with self._lock:
+                self._record_flag = True
+            bx, by = self._point_on_arc(q)
+            self.canvas.coords(self.best_dot, bx - 7, by - 7, bx + 7, by + 7)
+            self.canvas.itemconfig(self.best_dot, outline="#ffffff", fill="")
+        self.best_lbl.config(text="рекорд: %d%%" % self.best if self.best >= 0 else "рекорд: —")
+
+        self.history.append(self.display_q)
+        self.draw_graph()
+        self.prev = q
+
     # --- чтение сигнала + обновление подписей (раз в несколько кадров) ---
     def _read_and_update(self):
+        if self.target_ssid:
+            self._update_targeted()
+            return
         try:
             data = read_signal()
         except Exception:
@@ -590,6 +758,9 @@ class App:
         # читаем сигнал не каждый кадр, а раз в ~320 мс
         if self.frame % 8 == 0:
             self._read_and_update()
+        # список сетей в меню освежаем раз в ~2 с
+        if self.frame % 50 == 0:
+            self._rebuild_net_menu(self.networks)
 
         # плавно подтягиваем показываемое значение к целевому
         self.display_q += (self.target_q - self.display_q) * 0.18
