@@ -13,12 +13,16 @@ Wi-Fi Radar — графический искатель Wi-Fi по силе си
 Запуск:  python3 wifi_radar.py
 """
 
+import csv
+import os
 import platform
 import re
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
+from datetime import datetime
 
 APP_NAME = "Wi-Fi Radar"
 
@@ -446,13 +450,20 @@ class App:
         self.networks = []          # имена сетей для меню
         self._menu_names = None     # что сейчас в меню (чтобы не перестраивать зря)
 
+        # запись замеров в CSV
+        self.logging = False
+        self.log_fh = None
+        self.log_writer = None
+        self.log_path = None
+        self._log_last = 0.0
+
         root.title(APP_NAME)
         root.configure(bg=BG)
         root.resizable(False, False)
         try:
-            import os
-            _icon = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                 "assets", "icon.png")
+            base = getattr(sys, "_MEIPASS",
+                           os.path.dirname(os.path.abspath(__file__)))
+            _icon = os.path.join(base, "assets", "icon.png")
             if os.path.isfile(_icon):
                 self._iconimg = tk.PhotoImage(file=_icon)
                 root.iconphoto(True, self._iconimg)
@@ -549,6 +560,16 @@ class App:
                         font=self.f_small, bg=CARD, fg=FG, activebackground=TRACK,
                         activeforeground=FG, bd=0, padx=12, pady=6, highlightthickness=0)
         btn.grid(row=0, column=1, padx=8)
+        self.log_var = tk.BooleanVar(value=False)
+        logchk = tk.Checkbutton(ctrl, text="Запись", variable=self.log_var,
+                                command=self._toggle_log, font=self.f_small,
+                                bg=BG, fg=FG, selectcolor=CARD, activebackground=BG,
+                                activeforeground=FG, highlightthickness=0, bd=0)
+        logchk.grid(row=0, column=2, padx=8)
+
+        self.log_lbl = tk.Label(root, text="", font=self.f_small, bg=BG, fg=MUTED,
+                                wraplength=410)
+        self.log_lbl.pack(pady=(8, 0))
 
         tk.Label(root, text="Ходи по комнате или поднимай ноутбук туда, где растёт.",
                  font=self.f_small, bg=BG, fg=MUTED, wraplength=400).pack(side="bottom", pady=14)
@@ -595,12 +616,65 @@ class App:
         self.best = -1
         self.best_lbl.config(text="рекорд: —")
 
+    # --- запись замеров в CSV ---
+    def _toggle_log(self):
+        if self.log_var.get():
+            self._start_log()
+        else:
+            self._stop_log()
+
+    def _start_log(self):
+        name = "wifi-radar-log-%s.csv" % datetime.now().strftime("%Y%m%d-%H%M%S")
+        self.log_path = os.path.join(os.path.expanduser("~"), name)
+        try:
+            self.log_fh = open(self.log_path, "w", newline="", encoding="utf-8")
+            self.log_writer = csv.writer(self.log_fh)
+            self.log_writer.writerow(
+                ["time", "target", "ssid", "quality_percent", "dbm"])
+            self.log_fh.flush()
+            self.logging = True
+            self._log_last = 0.0
+            self.log_lbl.config(text="● запись → %s" % self.log_path, fg="#e5484d")
+        except Exception:
+            self.logging = False
+            self.log_var.set(False)
+            self.log_lbl.config(text="не удалось создать файл лога", fg=MUTED)
+
+    def _stop_log(self):
+        self.logging = False
+        try:
+            if self.log_fh:
+                self.log_fh.close()
+        except Exception:
+            pass
+        self.log_fh = None
+        self.log_writer = None
+        if self.log_path:
+            self.log_lbl.config(text="сохранено: %s" % self.log_path, fg=MUTED)
+
+    def _log_row(self, q, dbm, ssid):
+        if not self.logging or not self.log_writer:
+            return
+        now = time.time()
+        if now - self._log_last < 0.9:   # не чаще ~1 записи в секунду
+            return
+        self._log_last = now
+        target = "подключённая" if self.target_ssid is None else self.target_ssid
+        try:
+            self.log_writer.writerow([
+                datetime.now().isoformat(timespec="seconds"),
+                target, ssid or "", q, "" if dbm is None else dbm])
+            self.log_fh.flush()
+        except Exception:
+            pass
+
     def _on_close(self):
         for t in ("beeper", "scanner"):
             try:
                 getattr(self, t).stop()
             except Exception:
                 pass
+        self._stop_log()
         self.root.destroy()
 
     def consume_record_flag(self):
@@ -700,6 +774,7 @@ class App:
             self.canvas.itemconfig(self.best_dot, outline="#ffffff", fill="")
         self.best_lbl.config(text="рекорд: %d%%" % self.best if self.best >= 0 else "рекорд: —")
 
+        self._log_row(q, None, ssid)
         self.history.append(self.display_q)
         self.draw_graph()
         self.prev = q
@@ -758,6 +833,7 @@ class App:
             self.canvas.itemconfig(self.best_dot, outline="#ffffff", fill="")
         self.best_lbl.config(text="рекорд: %d%%" % self.best if self.best >= 0 else "рекорд: —")
 
+        self._log_row(q, dbm, ssid)
         self.history.append(self.display_q)  # пишем сглаженное — линия ровнее
         self.draw_graph()
         self.prev = q
