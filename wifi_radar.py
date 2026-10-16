@@ -71,11 +71,11 @@ def label_for(q):
     return "очень слабо"
 
 
-def _run(cmd):
+def _run(cmd, timeout=4):
     """Запустить команду, вернуть stdout (пустую строку при любой ошибке)."""
     try:
         out = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=4,
+            cmd, capture_output=True, text=True, timeout=timeout,
             errors="replace",
         )
         return out.stdout or ""
@@ -229,10 +229,13 @@ def read_signal():
 
 # ── Сканирование всех соседних сетей (без пароля — из открытых маячков) ──
 
-def _scan_linux(rescan=True):
-    args = ["nmcli", "-t", "-f", "SIGNAL,SSID", "dev", "wifi", "list",
-            "--rescan", "yes" if rescan else "no"]
-    out = _run(args)
+def _scan_linux(rescan=False):
+    # по умолчанию берём уже готовый список NetworkManager (мгновенно);
+    # полный пере-скан запускаем реже и с большим таймаутом
+    args = ["nmcli", "-t", "-f", "SIGNAL,SSID", "dev", "wifi", "list"]
+    if rescan:
+        args += ["--rescan", "yes"]
+    out = _run(args, timeout=15 if rescan else 4)
     nets = {}
     for ln in out.splitlines():
         sig, sep, ssid = ln.partition(":")
@@ -266,12 +269,12 @@ def _scan_windows():
     return nets
 
 
-def scan_networks():
+def scan_networks(rescan=False):
     """Вернуть {ssid: качество 0..100} по всем видимым сетям. Без пароля."""
     system = platform.system()
     try:
         if system == "Linux":
-            return _scan_linux()
+            return _scan_linux(rescan=rescan)
         if system == "Windows":
             return _scan_windows()
     except Exception:
@@ -386,13 +389,17 @@ class Scanner(threading.Thread):
         self._stop = threading.Event()
 
     def run(self):
+        first = True
         while not self._stop.is_set():
-            nets = scan_networks()
+            # свежий пере-скан: один раз на старте и пока наведены на чужую сеть;
+            # в остальное время — мгновенный список из кэша NetworkManager
+            force = first or (self.app.target_ssid is not None)
+            nets = scan_networks(rescan=force)
             if nets:
                 self.app.scan_targets = nets
                 self.app.networks = sorted(nets, key=lambda k: -nets[k])
-            # когда наведены на чужую сеть — сканируем чаще
-            self._stop.wait(2.5 if self.app.target_ssid else 8.0)
+            first = False
+            self._stop.wait(2.5 if self.app.target_ssid else 6.0)
 
     def stop(self):
         self._stop.set()
@@ -571,6 +578,8 @@ class App:
         m.add_command(label="Текущая сеть",
                       command=lambda: (self.net_var.set("Текущая сеть"),
                                        self._on_net_change("Текущая сеть")))
+        if not names:
+            m.add_command(label="  поиск сетей…", state="disabled")
         for nm in names:
             q = self.scan_targets.get(nm)
             label = "%s  (%d%%)" % (nm, q) if q is not None else nm
